@@ -1,12 +1,13 @@
+import getpass
 import inspect
 import os
 import re
 import sys
 import tempfile
 from os.path import abspath, dirname
+from typing import Any, Dict, Optional, Set, Type, TYPE_CHECKING, Union
 
 import torch
-from . import external_utils
 
 # to configure logging for dynamo, aot, and inductor
 # use the following API in the torch._logging module
@@ -16,7 +17,7 @@ from . import external_utils
 # Design doc: https://docs.google.com/document/d/1ZRfTWKa8eaPq1AxaiHrq4ASTPouzzlPiuquSBEJYwS8/edit#
 # the name of a file to write the logs to
 # [@compile_ignored: debug]
-log_file_name = None
+log_file_name: Optional[str] = None
 
 # [@compile_ignored: debug] Verbose will print full stack traces on warnings and errors
 verbose = os.environ.get("TORCHDYNAMO_VERBOSE", "0") == "1"
@@ -48,19 +49,12 @@ accumulated_cache_size_limit = 64
 # to be dynamic, but accesses to ints should NOT get promoted into inputs.
 specialize_int = False
 
-# Assume these functions return constants
-constant_functions = {
-    torch.jit.is_scripting: False,
-    torch.jit.is_tracing: False,
-    torch._C._get_tracing_state: None,
-    torch.fx._symbolic_trace.is_fx_tracing: False,
-    torch.onnx.is_in_onnx_export: False,
-    external_utils.is_compiling: True,
-    torch._utils.is_compiling: True,
-}
-
 # legacy config, does nothing now!
 dynamic_shapes = True
+
+use_lazy_graph_module = (
+    os.environ.get("TORCH_COMPILE_USE_LAZY_GRAPH_MODULE", "1") == "1"
+)
 
 # This is a temporarily flag, which changes the behavior of dynamic_shapes=True.
 # When assume_static_by_default is True, we only allocate symbols for shapes marked dynamic via mark_dynamic.
@@ -125,7 +119,7 @@ guard_nn_modules_using_dict_tags = True
 # We do NOT currently support __torch_dispatch__.  The implementation is
 # currently buggy, the main show stopper for nontrivial use is
 # https://github.com/pytorch/torchdynamo/issues/1952
-traceable_tensor_subclasses = set()
+traceable_tensor_subclasses: Set[Type[Any]] = set()
 
 # Suppress errors in torch._dynamo.optimize, instead forcing a fallback to eager.
 # This is a good way to get your model to work one way or another, but you may
@@ -141,9 +135,6 @@ replay_record_enabled = os.environ.get("TORCH_COMPILE_DEBUG", "0") == "1"
 # Rewrite assert statement in python with torch._assert
 rewrite_assert_with_torch_assert = True
 
-# [@compile_ignored: debug] Show a warning for every specialization
-print_specializations = False
-
 # Disable dynamo
 disable = os.environ.get("TORCH_COMPILE_DISABLE", False)
 
@@ -151,7 +142,7 @@ disable = os.environ.get("TORCH_COMPILE_DISABLE", False)
 cprofile = os.environ.get("TORCH_COMPILE_CPROFILE", False)
 
 # legacy config, does nothing now!
-skipfiles_inline_module_allowlist = {}
+skipfiles_inline_module_allowlist: Dict[Any, Any] = {}
 
 # If a string representing a PyTorch module is in this ignorelist,
 # the `allowed_functions.is_allowed` function will not consider it
@@ -229,12 +220,56 @@ force_unspec_int_unbacked_size_like_on_torchrec_kjt = False
 # false_fn produces code with identical guards.
 enforce_cond_guards_match = True
 
-# Automatically split model graph into pieces to match DDP bucket sizes
-# to allow DDP comm/compute overlap.  Disable to allow DDP models to
-# run without graph-breaks, but also without comm/compute overlap.
-# set torch._dynamo.config.log_level to INFO or DEBUG for more info
-# about optimize_ddp behavior.
-optimize_ddp = True
+# Specify how to optimize a compiiled DDP module. The flag accepts a bollean
+# value or a string. There are 4 modes.
+# 1. "ddp_optimizer" (or True): with "ddp_ptimizer", Dynamo will automatically
+# split model graph into pieces to match DDP bucket sizes to allow DDP
+# comm/compute overlap.
+# 2. "python_reducer" (experimental): this optimization requires the usage
+# of compiled_autograd. With "python_reducer", DDP will disable the C++ reducer
+# and use the Python reducer to allow compiled_autograd to trace the
+# communication and allow comm/compute overlap without graph-breaks.
+# 3. "python_reducer_without_compiled_forward" (experimental): this mode is
+# similar to "python_reducer". One should only use this optimization mode
+# when compiled_autograd is used but the DDP module is not compiled.
+# 4. "no_optimization" (or False): Dynamo won't split the model graph, nor
+# will Python reducer be used. With this mode, there will be no graph-breaks
+# and the original DDP C++ reducer will be used. There will no comm/compute
+# overlap. This mode CANNOT be used with compiled_autograd.
+# Note that to avoid breaking the existing usage, mode 1 and mode 4 can be
+# specified with a boolean value. True is using ddp_optimizer and False is
+# no optimization.
+optimize_ddp: Union[bool, str] = True
+
+_ddp_optimization_mode = [
+    "ddp_optimizer",
+    "python_reducer",  # experimental mode
+    "python_reducer_without_compiled_forward",  # experimental mode
+    "no_optimization",
+]
+
+
+def _get_optimize_ddp_mode():
+    m = sys.modules[__name__]
+    if isinstance(m.optimize_ddp, bool):
+        if m.optimize_ddp:
+            mode = "ddp_optimizer"
+        else:
+            mode = "no_optimization"
+    elif isinstance(m.optimize_ddp, str):
+        mode = m.optimize_ddp
+    else:
+        raise ValueError(f"Invalid type, {type(optimize_ddp)=}")
+
+    assert mode in m._ddp_optimization_mode, f"Invalid mode {mode=}"
+    return mode
+
+
+# If True, delays DDPOptimizer submodule compilation to 1st run of the model,
+# so that real tensor strides are used in all submodules
+# (instead of using FakeTensor strides which can differ from real tensor strides and causes error in some cases).
+# This feature is not hardened yet and it's known to cause issues to some models, so False by default.
+optimize_ddp_lazy_compile = False
 
 # Whether to skip guarding on FSDP-managed modules
 skip_fsdp_guards = True
@@ -266,40 +301,11 @@ allow_rnn = False
 # [@compile_ignored: runtime_behaviour]
 error_on_recompile = False
 
-# reports why guards fail. Useful to identify the guards failing frequently and
-# causing recompilations.
-# [@compile_ignored: debug]
-report_guard_failures = os.environ.get("TORCHDYNAMO_REPORT_GUARD_FAILURES") == "1"
-
-# [@compile_ignored: debug] Whether to report all guard failures or just the first one that fails
-report_all_guard_failures = False
+# [@compile_ignored: debug] Whether to report any guard failures (deprecated: does not do anything)
+report_guard_failures = True
 
 # [@compile_ignored: debug] root folder of the project
 base_dir = dirname(dirname(dirname(abspath(__file__))))
-
-# [@compile_ignored: debug] Uses z3 for validating the guard optimizations transformations.
-translation_validation = (
-    os.environ.get("TORCHDYNAMO_TRANSLATION_VALIDATION", "0") == "1"
-)
-# Timeout (in milliseconds) for z3 finding a solution.
-# [@compile_ignored: debug]
-translation_validation_timeout = int(
-    os.environ.get("TORCHDYNAMO_TRANSLATION_VALIDATION_TIMEOUT", "600000")
-)
-# Disables bisection for translation validation.
-#
-# Translation validation bisection is enabled by default, if translation validation
-# is also enabled. This should help finding guard simplification issues. However,
-# since validation uses Z3 for bisecting, it might take a lot of time.
-#
-# Set this configuration option so as to avoid bisecting.
-# [@compile_ignored: debug]
-translation_validation_no_bisect = (
-    os.environ.get("TORCHDYNAMO_TRANSLATION_NO_BISECT", "0") == "1"
-)
-# Checks whether replaying ShapeEnv events on a freshly constructed one yields
-# the a ShapeEnv with the same state. This should be used only in testing.
-check_shape_env_recorded_events = False
 
 # Trace through NumPy or graphbreak
 trace_numpy = True
@@ -321,20 +327,21 @@ def is_fbcode():
     return not hasattr(torch.version, "git_version")
 
 
-DEBUG_DIR_VAR_NAME = "TORCH_COMPILE_DEBUG_DIR"  # [@compile_ignored: debug]
+def default_debug_dir_root():
+    # [@compile_ignored: debug]
+    DEBUG_DIR_VAR_NAME = "TORCH_COMPILE_DEBUG_DIR"
+    if DEBUG_DIR_VAR_NAME in os.environ:
+        return os.path.join(os.environ[DEBUG_DIR_VAR_NAME], "torch_compile_debug")
+    elif is_fbcode():
+        return os.path.join(
+            tempfile.gettempdir(), getpass.getuser(), "torch_compile_debug"
+        )
+    else:
+        return os.path.join(os.getcwd(), "torch_compile_debug")
 
-if DEBUG_DIR_VAR_NAME in os.environ:
-    debug_dir_root = os.path.join(  # [@compile_ignored: debug]
-        os.environ[DEBUG_DIR_VAR_NAME], "torch_compile_debug"
-    )
-elif is_fbcode():
-    debug_dir_root = os.path.join(  # [@compile_ignored: debug]
-        tempfile.gettempdir(), "torch_compile_debug"
-    )
-else:
-    debug_dir_root = os.path.join(  # [@compile_ignored: debug]
-        os.getcwd(), "torch_compile_debug"
-    )
+
+# [@compile_ignored: debug]
+debug_dir_root = default_debug_dir_root()
 
 # [@compile_ignored: debug]
 _save_config_ignore = {
@@ -355,16 +362,17 @@ only_allow_pt2_compliant_ops = False
 capture_autograd_function = True
 
 # enable/disable dynamo tracing for `torch.func` transforms
-capture_func_transforms = True
+capture_func_transforms = False
+
+# enable/disable user-defined triton kernel optimizations
+optimize_user_defined_triton_kernels = True
+
+# If to log Dynamo compilation metrics into log files (for OSS) and Scuba tables (for fbcode).
+log_compilation_metrics = True
 
 # simulates what would happen if we didn't have support for BUILD_SET opcode,
 # used for testing
 inject_BUILD_SET_unimplemented_TESTING_ONLY = False
-
-# wraps (un)equalities with 'Not' class after recording the correct expression
-# in the FX graph. This should incorrectly construct the divisible and replacement
-# lists, and incorrectly issue guards.
-inject_EVALUATE_EXPR_flip_equality_TESTING_ONLY = False
 
 _autograd_backward_strict_mode_banned_ops = [
     "stride",
@@ -378,11 +386,28 @@ _autograd_backward_strict_mode_banned_ops.extend(
     [name for name, _ in inspect.getmembers(torch.Tensor) if re.match(r"^is_.*", name)]
 )
 
+# Enables caching of dispatches to fake tensors.
+fake_tensor_cache_enabled = (
+    os.environ.get("TORCH_FAKE_TENSOR_DISPATCH_CACHE", "0" if is_fbcode() else "1")
+    == "1"
+)
+
+# Enables cross checking between the fake tensor cache and dispatch.
+fake_tensor_cache_crosscheck_enabled = (
+    os.environ.get("TORCH_FAKE_TENSOR_DISPATCH_CACHE_CROSSCHECK", "0") == "1"
+)
 
 # support `context_fn` in torch.utils.checkpoint.checkpoint API under torch.compile().
 # WARNING: this is an experimental flag and is subject to change.
 _experimental_support_context_fn_in_torch_utils_checkpoint = False
 
-from .config_utils import install_config_module
+if TYPE_CHECKING:
+    from torch.utils._config_typing import *  # noqa: F401, F403
+
+    def _make_closure_patcher(**changes):
+        ...
+
+
+from torch.utils._config_module import install_config_module
 
 install_config_module(sys.modules[__name__])

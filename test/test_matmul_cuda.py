@@ -30,6 +30,7 @@ from torch.testing._internal.common_utils import (
     run_tests,
     skipIfRocmVersionLessThan,
     TEST_WITH_ROCM,
+    skipIfRocm,
     TestCase,
 )
 
@@ -51,15 +52,7 @@ class TestMatmulCuda(TestCase):
         torch.backends.cuda.matmul.allow_tf32 = True
         super(self.__class__, self).tearDown()
 
-    @onlyCUDA
-    @skipIfRocmVersionLessThan((5, 2))
-    # imported 'tol' as 'xtol' to avoid aliasing in code above
-    @toleranceOverride({torch.float16: xtol(atol=1e-1, rtol=1e-1),
-                        torch.bfloat16: xtol(atol=1e-1, rtol=1e-1),
-                        torch.float32: xtol(atol=1e-1, rtol=1e-1)})
-    @dtypes(torch.float16, torch.bfloat16, torch.float32)
-    @parametrize("size", [100, 1000, 10000])
-    def test_cublas_addmm(self, size: int, dtype: torch.dtype):
+    def cublas_addmm(self, size: int, dtype: torch.dtype, reduced_precision: bool = False):
         #
         # Check for catastrophic cuBLAS inaccuracy by measuring the deviation between
         # results from the CUDA invocation of torch.addmm and the CPU invocation
@@ -69,9 +62,10 @@ class TestMatmulCuda(TestCase):
         n, m, p = (size + 1, size, size + 2)
         # Disable reduced precision reductions in BFloat16 to bypass some kernels
         # which fail the threshold check
-        orig = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
-        if dtype == torch.bfloat16 and torch.cuda.get_device_capability() >= (8, 6):
-            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        orig_bf16 = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+        orig_fp16 = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = reduced_precision
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = reduced_precision
         # Make random tensors on CPU (seed set on common_utils.py import)
         # (Not using numpy because it does not support bfloat16)
         make_arg = partial(make_tensor, dtype=dtype, device="cpu")
@@ -110,11 +104,34 @@ class TestMatmulCuda(TestCase):
         res_cuda = res_cuda.to("cpu")
         # Compare
         self.assertEqual(res_cpu, res_cuda)
-        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = orig
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = orig_bf16
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = orig_fp16
 
     @onlyCUDA
-    def test_cublas_addmm_alignment(self):
-        dtype = torch.half
+    @skipIfRocmVersionLessThan((5, 2))
+    # imported 'tol' as 'xtol' to avoid aliasing in code above
+    @toleranceOverride({torch.float16: xtol(atol=1e-1, rtol=1e-1),
+                        torch.bfloat16: xtol(atol=1e-1, rtol=1e-1),
+                        torch.float32: xtol(atol=1e-1, rtol=1e-1)})
+    @dtypes(torch.float16, torch.bfloat16, torch.float32)
+    @parametrize("size", [100, 1000, 10000])
+    def test_cublas_addmm(self, size: int, dtype: torch.dtype):
+        self.cublas_addmm(size, dtype, False)
+
+    @onlyCUDA
+    @skipIfRocmVersionLessThan((5, 2))
+    # imported 'tol' as 'xtol' to avoid aliasing in code above
+    @toleranceOverride({torch.float16: xtol(atol=7e-1, rtol=2e-1),
+                        torch.bfloat16: xtol(atol=1e1, rtol=2e-1)})
+    @dtypes(torch.float16, torch.bfloat16)
+    @parametrize("size", [100, 1000, 10000])
+    def test_cublas_addmm_reduced_precision(self, size: int, dtype: torch.dtype):
+        self.cublas_addmm(size, dtype, True)
+
+    @onlyCUDA
+    @toleranceOverride({torch.float16: xtol(atol=1e-3, rtol=2e-3)})
+    @dtypes(torch.float16)
+    def test_cublas_addmm_alignment(self, dtype):
         device = 'cuda'
         # perturb X, A, or B alignment
         for idx in range(0, 3):
@@ -144,6 +161,7 @@ class TestMatmulCuda(TestCase):
          (1, 10000, 10000, 10000)],
         name_fn=lambda batch_size, N, M, P: f"{batch_size}_{N}_{M}_{P}",
     )
+    @skipIfRocm
     def test_cublas_baddbmm_large_input(self, device, batch_size, N, M, P, dtype):
         cpu_dtype = dtype
         if dtype == torch.float16 or dtype == torch.bfloat16:
@@ -186,10 +204,19 @@ class TestMatmulCuda(TestCase):
         self.assertEqual(out1_gpu, out2_gpu[0])
 
 
+def scaled_mm_supported_device():
+    return torch.cuda.is_available() and (
+        torch.cuda.get_device_capability() >= (9, 0) or torch.cuda.get_device_capability() == (8, 9)
+    )
+
+
 @unittest.skipIf(TEST_WITH_ROCM, "FP8 is not supported on ROCM")
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA not found")
 class TestFP8MatmulCuda(TestCase):
-    @unittest.skipIf(not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0), "FP8 is only supported on H100+")
+
+
+
+    @unittest.skipIf(not scaled_mm_supported_device(), "FP8 is only supported on H100+ and sm_89 devices")
     def _test_tautological_mm(self, device: str = "cuda",
                               x_dtype: torch.dtype = torch.float8_e4m3fn,
                               y_dtype: torch.dtype = torch.float8_e4m3fn,
@@ -205,7 +232,7 @@ class TestFP8MatmulCuda(TestCase):
             self.assertEqual(out_fp32.amax(), amax_fp8)
         self.assertEqual(out_fp32, out_fp8.to(torch.float))
 
-    @unittest.skipIf(not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0), "FP8 is only supported on H100+")
+    @unittest.skipIf(not scaled_mm_supported_device(), "FP8 is only supported on H100+ and sm_89 devices")
     def test_float8_basics(self, device) -> None:
         self._test_tautological_mm(device, torch.float8_e4m3fn, torch.float8_e4m3fn, size=16)
         self._test_tautological_mm(device, torch.float8_e4m3fn, torch.float8_e5m2, size=32)
@@ -214,15 +241,13 @@ class TestFP8MatmulCuda(TestCase):
         with self.assertRaises(RuntimeError):
             self._test_tautological_mm(device, torch.float8_e5m2, torch.float8_e5m2)
 
-    @unittest.skipIf(not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0), "FP8 is only supported on H100+")
-    def test_float8_out_dtype(self, device) -> None:
         self._test_tautological_mm(device, size=64, out_dtype=torch.float16)
         self._test_tautological_mm(device, size=96, out_dtype=torch.float32)
         self._test_tautological_mm(device, size=80, out_dtype=torch.bfloat16)
         with self.assertRaises(RuntimeError):
             self._test_tautological_mm(device, out_dtype=torch.float8_e5m2)
 
-    @unittest.skipIf(not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0), "FP8 is only supported on H100+")
+    @unittest.skipIf(not scaled_mm_supported_device(), "FP8 is only supported on H100+ and sm_89 devices")
     def test_float8_scale(self, device) -> None:
         size = (16, 16)
         x = torch.full(size, .5, device=device, dtype=torch.float8_e4m3fn)
@@ -234,7 +259,7 @@ class TestFP8MatmulCuda(TestCase):
         out_fp8_s, amax_fp8_s = torch._scaled_mm(x, y, scale_a=scale_a, scale_b=scale_b)
         self.assertEqual(out_fp8, out_fp8_s)
 
-    @unittest.skipIf(not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0), "FP8 is only supported on H100+")
+    @unittest.skipIf(not scaled_mm_supported_device(), "FP8 is only supported on H100+ and sm_89 devices")
     def test_float8_bias(self, device) -> None:
         (k, l, m) = (16, 48, 32)
         x = torch.rand((k, l), device=device).to(torch.float8_e4m3fn)
@@ -244,7 +269,7 @@ class TestFP8MatmulCuda(TestCase):
         outb_fp8, amaxb_fp8 = torch._scaled_mm(x, y, bias=bias)
         self.assertEqual((amaxb_fp8 - amax_fp8).item(), 4.0)
 
-    @unittest.skipIf(not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0), "FP8 is only supported on H100+")
+    @unittest.skipIf(not scaled_mm_supported_device(), "FP8 is only supported on H100+ and sm_89 devices")
     @parametrize("bias", [True, False])
     def test_non_divisible_leading_dim(self, device, bias: torch.bool) -> None:
         x = torch.rand((17, 16), device=device).to(torch.float8_e4m3fn)
@@ -254,7 +279,7 @@ class TestFP8MatmulCuda(TestCase):
             input_bias = torch.rand((16,), device=device).to(torch.half)
         out_fp8, amax_fp8 = torch._scaled_mm(x, y, bias=input_bias)
 
-    @unittest.skipIf(not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0), "FP8 is only supported on H100+")
+    @unittest.skipIf(not scaled_mm_supported_device(), "FP8 is only supported on H100+ and sm_89 devices")
     def test_float8_bias_relu_edgecase(self, device) -> None:
         (k, l, m) = (16, 48, 32)
         x = torch.full((k, l), 0.0, device=device).to(torch.float8_e4m3fn)
@@ -263,7 +288,7 @@ class TestFP8MatmulCuda(TestCase):
         outb_fp8, amaxb_fp8 = torch._scaled_mm(x, y, bias=bias)
         self.assertEqual(amaxb_fp8.item(), 3.0)
 
-    @unittest.skipIf(not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0), "FP8 is only supported on H100+")
+    @unittest.skipIf(not scaled_mm_supported_device(), "FP8 is only supported on H100+ and sm_89 devices")
     def test_float32_output_errors_with_bias(self, device) -> None:
         (k, l, m) = (16, 48, 32)
         x = torch.rand((k, l), device=device).to(torch.float8_e4m3fn)
@@ -275,19 +300,19 @@ class TestFP8MatmulCuda(TestCase):
             lambda: torch._scaled_mm(x, y, bias=bias, out_dtype=torch.float32),
         )
 
-    @unittest.skipIf(not torch.cuda.is_available() or torch.cuda.get_device_capability() >= (9, 0),
-                     "This test is only for devices with compute capability < 9.0")
-    def test_error_message_fp8_non_h100(self, device) -> None:
+    @unittest.skipIf(scaled_mm_supported_device(),
+                     "This test is only for devices with compute capability < 8.9")
+    def test_error_message_fp8_pre_sm89(self, device) -> None:
         (k, l, m) = (16, 48, 32)
         x = torch.rand((k, l), device=device).to(torch.float8_e4m3fn)
         y = torch.rand((m, l), device=device).to(torch.float8_e4m3fn).t()
         self.assertRaisesRegex(
             RuntimeError,
-            r"torch\.\_scaled\_mm is only supported on devices with compute capability \>\= 9\.0",
+            r"torch\.\_scaled\_mm is only supported on devices with compute capability \>\= 9\.0 or 8\.9",
             lambda: torch._scaled_mm(x, y, out_dtype=torch.float32),
         )
 
-    @unittest.skipIf(not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0), "FP8 is only supported on H100+")
+    @unittest.skipIf(not scaled_mm_supported_device(), "FP8 is only supported on H100+ and sm_89 devices")
     def test_float8_scale_fast_accum(self, device) -> None:
         size = (16, 16)
         x = torch.full(size, .5, device=device, dtype=torch.float8_e4m3fn)

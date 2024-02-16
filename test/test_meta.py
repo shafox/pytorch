@@ -1,4 +1,4 @@
-# Owner(s): ["module: primTorch"]
+# Owner(s): ["module: decompositions"]
 
 import itertools
 import torch
@@ -12,6 +12,8 @@ from torch._subclasses.meta_utils import MetaConverter, assert_metadata_eq
 import torch.utils._python_dispatch
 from torch._dispatch.python import enable_python_dispatcher
 from torch._ops import OpOverload, OpOverloadPacket
+from torch.testing import make_tensor
+from torch.testing._internal.common_utils import unMarkDynamoStrictTest
 from torch.testing._internal.common_utils import (
     TestCase,
     skipIfCrossRef,
@@ -30,10 +32,14 @@ from torch.testing._internal.common_device_type import (
     onlyCPU,
     OpDTypes,
 )
-from torch.testing._internal.common_methods_invocations import op_db
+from torch.testing._internal.common_methods_invocations import (
+    binary_ufuncs, op_db, foreach_unary_op_db, foreach_binary_op_db,
+    foreach_pointwise_op_db, foreach_reduce_op_db, foreach_other_op_db)
+from torch.testing._internal.opinfo.core import S, SampleInput
 from torchgen.yaml_utils import YamlLoader
 from torchgen.model import OperatorName
 
+import copy
 import sys
 import yaml
 import atexit
@@ -43,7 +49,7 @@ from collections.abc import Iterable
 import unittest
 import warnings
 import weakref
-from functools import wraps
+from functools import partial, wraps
 
 bf16 = torch.bfloat16
 f64 = torch.float64
@@ -58,6 +64,15 @@ i32 = torch.int32
 i64 = torch.int64
 b8 = torch.bool
 u8 = torch.uint8
+
+foreach_op_db = (
+    foreach_unary_op_db +
+    foreach_binary_op_db +
+    foreach_pointwise_op_db +
+    foreach_reduce_op_db +
+    foreach_other_op_db
+)
+
 
 class TestMetaConverter(TestCase):
     def assertSameVersionCounter(self, m1, m2):
@@ -386,22 +401,24 @@ def assert_ref_meta_equal(test_case, func, meta_rs, rs, msg_callable):
         if not isinstance(r, torch.Tensor):
             continue
         test_assert(isinstance(meta_r, torch.Tensor), f"but real {i}th result is Tensor")
-        test_assert(meta_r.dtype == r.dtype, f"but real dtype was {r.dtype}")
-        test_assert(meta_r.shape == r.shape, f"but real shape was {r.shape}")
+        test_assert(meta_r.dtype == r.dtype, f"for element {i}, was {meta_r.dtype} but real dtype was {r.dtype}")
+        test_assert(meta_r.shape == r.shape, f"for element {i}, was {meta_r.shape} but real shape was {r.shape}")
         # See https://github.com/pytorch/pytorch/issues/78050
         if should_check_strides(func) == CheckStrides.ALL:
             same_strides, _ = torch._prims_common.check_all_strides(meta_r, r)
-            test_assert(same_strides, f"but real stride was {r.stride()}")
+            test_assert(same_strides, f"for element {i}, was {meta_r.stride()} but real stride was {r.stride()}")
         elif should_check_strides(func) == CheckStrides.SIGNIFICANT:
             same_strides, _ = torch._prims_common.check_significant_strides(meta_r, r)
-            test_assert(same_strides, f"but real stride was {r.stride()}")
+            test_assert(same_strides, f"for element {i}, was {meta_r.stride()} but real stride was {r.stride()}")
         test_assert(
             meta_r.storage_offset() == r.storage_offset(),
-            f"but real storage_offset was {r.storage_offset()}")
-        test_assert(meta_r.requires_grad == r.requires_grad, f"but real requires_grad was {r.requires_grad}")
+            f"for element {i}, was {meta_r.storage_offset()} but real storage_offset was {r.storage_offset()}")
+        test_assert(meta_r.requires_grad == r.requires_grad,
+                    f"for element {i}, was {meta_r.requires_grad} but real requires_grad was {r.requires_grad}")
         if func not in CHECK_CONJ_SKIPS:
-            test_assert(meta_r.is_conj() == r.is_conj(), f"but real is_conj was {r.is_conj()}")
-        test_assert(meta_r.is_neg() == r.is_neg(), f"but real is_neg was {r.is_neg()}")
+            test_assert(meta_r.is_conj() == r.is_conj(),
+                        f"for element {i}, was {meta_r.is_conj()} but real is_conj was {r.is_conj()}")
+        test_assert(meta_r.is_neg() == r.is_neg(), f"for element {i}, was {meta_r.is_neg()} but real is_neg was {r.is_neg()}")
 
 
 # This environment variable controls whether or not we print expected failure
@@ -504,8 +521,7 @@ def run_meta_crossref(
     try:
         rs = func(*args, **kwargs)
     except Exception as e:
-        raise RuntimeError("Original OpInfo is broken") from e
-
+        raise AssertionError("Original OpInfo is broken") from e
 
     # TODO: also handle cases where func raise an exception
 
@@ -634,7 +650,6 @@ meta_function_expected_failures = {
     torch.kthvalue : {f64, i32, i64, u8, i16, f16, bf16, i8, f32},
     torch.nn.functional.ctc_loss : {f64, f32},
     torch.nn.functional.gaussian_nll_loss : {f16, f64, bf16, f32},
-    torch.nn.functional.one_hot : {i64},
     torch.linalg.eig : {f64, f32, c128, c64},
     torch.linalg.eigvals : {f64, f32, c128, c64},
     torch.linalg.lstsq : {f64, f32, c128, c64},
@@ -680,12 +695,12 @@ meta_function_skips = {
     torch.equal : {bf16, i8, c32, i64, u8, c128, b8, f64, i16, i32, f32, f16, c64},
     torch.nanmean : {bf16, f64, f32, f16, c32, c64, c128},
     torch.nn.functional.cross_entropy : {bf16, f64, f32},
-    torch.nn.functional.interpolate : {bf16, f64, f32, u8},
     torch.nn.functional.nll_loss : {bf16, f64, f32},
     torch.linalg.cond : {c128, c64, f32, f64},
     torch.linalg.vecdot : {bf16, f64, f32, f16},
     torch.empty : {bf16, i8, c32, i64, u8, c128, b8, f64, i16, i32, f32, f16, c64},
     torch.Tensor.addbmm_: {bf16, c128, c64, f32, f64, i16, i32, i64, i8, u8},
+    torch.nn.functional.one_hot : {i64},
 }
 
 
@@ -696,7 +711,7 @@ meta_function_device_skips = defaultdict(dict)
 meta_function_device_expected_failures['cpu'] = {
     torch.native_batch_norm: {bf16, f16},
     torch._native_batch_norm_legit: {bf16, f16},
-    torch.native_layer_norm: {bf16},
+    torch.native_layer_norm: {bf16, f16},
 }
 
 meta_function_device_expected_failures['cuda'] = {
@@ -841,7 +856,7 @@ meta_dispatch_device_expected_failures['cpu'] = {
     aten.native_batch_norm.default: {bf16, f16},
     aten._native_batch_norm_legit.default: {bf16, f16},
     aten._native_batch_norm_legit.no_stats: {bf16, f16},
-    aten.native_layer_norm.default: {bf16},
+    aten.native_layer_norm.default: {bf16, f16},
     aten.histc.default: {f16},
     aten.histc.out: {f16},
 }
@@ -1094,20 +1109,24 @@ class MetaCrossRefDispatchMode(torch.utils._python_dispatch.TorchDispatchMode):
 # inconsistencies between CUDA and CPU, and running on CUDA makes it easier
 # to ignore the CPU case when inconsistencies arise.  Ideally we deal
 # with the inconsistencies but this takes time.
+@unMarkDynamoStrictTest
 class TestMeta(TestCase):
     # Copies inputs to inplace operations to avoid inplace modifications
     #   to leaves requiring gradient
     def _get_safe_inplace(self, inplace_variant):
         @wraps(inplace_variant)
         def _fn(t, *args, **kwargs):
-            return inplace_variant(t.clone(), *args, **kwargs)
+            if isinstance(t, list):
+                return inplace_variant([x.clone() for x in t], *args, **kwargs)
+            else:
+                return inplace_variant(t.clone(), *args, **kwargs)
 
         return _fn
 
     @unittest.skipIf(TEST_WITH_ASAN, "Skipped under ASAN")
     @skipIfCrossRef
     @suppress_warnings
-    @ops(op_db)
+    @ops(itertools.chain(op_db, foreach_op_db))
     def test_meta_outplace(self, device, dtype, op):
         skip_op_names = (
             "fft.ihfft",
@@ -1152,7 +1171,7 @@ class TestMeta(TestCase):
     @unittest.skipIf(TEST_WITH_ASAN, "Skipped under ASAN")
     @skipIfCrossRef
     @suppress_warnings
-    @ops(op_db)
+    @ops(itertools.chain(op_db, foreach_op_db))
     def test_meta_inplace(self, device, dtype, op):
         func = op.get_inplace()
         if not func:
@@ -1215,21 +1234,21 @@ class TestMeta(TestCase):
     @unittest.skipIf(TEST_WITH_ASAN, "Skipped under ASAN")
     @skipIfCrossRef
     @suppress_warnings
-    @ops(op_db)
+    @ops(itertools.chain(op_db, foreach_op_db))
     def test_dispatch_meta_outplace(self, device, dtype, op):
         self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=False, inplace=False)
 
     @unittest.skipIf(TEST_WITH_ASAN, "Skipped under ASAN")
     @skipIfCrossRef
     @suppress_warnings
-    @ops(op_db)
+    @ops(itertools.chain(op_db, foreach_op_db))
     def test_dispatch_meta_inplace(self, device, dtype, op):
         self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=False, inplace=True)
 
     @unittest.skipIf(TEST_WITH_ASAN, "Skipped under ASAN")
     @skipIfCrossRef
     @suppress_warnings
-    @ops(op_db)
+    @ops(itertools.chain(op_db, foreach_op_db))
     def test_dispatch_symbolic_meta_outplace(self, device, dtype, op):
         self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=True, inplace=False)
 
@@ -1237,7 +1256,7 @@ class TestMeta(TestCase):
     @unittest.skipIf(TEST_WITH_ASAN, "Skipped under ASAN")
     @skipIfCrossRef
     @suppress_warnings
-    @ops(op_db)
+    @ops(itertools.chain(op_db, foreach_op_db))
     def test_dispatch_symbolic_meta_inplace(self, device, dtype, op):
         self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=True, inplace=True)
 
@@ -1245,7 +1264,7 @@ class TestMeta(TestCase):
     @skipIfCrossRef
     @suppress_warnings
     # only test one dtype, as output stride behavior is the same for all dtypes
-    @ops(op_db, dtypes=OpDTypes.any_common_cpu_cuda_one)
+    @ops(itertools.chain(op_db, foreach_op_db), dtypes=OpDTypes.any_common_cpu_cuda_one)
     # Only test on CUDA, as CUDA kernel's stride is the reference
     @onlyCUDA
     def test_dispatch_symbolic_meta_outplace_all_strides(self, device, dtype, op):
@@ -1255,11 +1274,34 @@ class TestMeta(TestCase):
     @skipIfCrossRef
     @suppress_warnings
     # only test one dtype, as output stride behavior is the same for all dtypes
-    @ops(op_db, dtypes=OpDTypes.any_common_cpu_cuda_one)
+    @ops(itertools.chain(op_db, foreach_op_db), dtypes=OpDTypes.any_common_cpu_cuda_one)
     # Only test on CUDA, as CUDA kernel's stride is the reference
     @onlyCUDA
     def test_dispatch_symbolic_meta_inplace_all_strides(self, device, dtype, op):
         self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=True, inplace=True, all_stride_variants=True)
+
+    @unittest.skipIf(TEST_WITH_ASAN, "Skipped under ASAN")
+    @skipIfCrossRef
+    @suppress_warnings
+    # only test one dtype, as output stride behavior is the same for all dtypes
+    @ops(binary_ufuncs, allowed_dtypes=(torch.float32,))
+    # Only test on CUDA, as CUDA kernel's stride is the reference
+    @onlyCUDA
+    def test_binary_ufuncs_mixed_dtype(self, device, dtype, op):
+        make_arg = partial(
+            make_tensor,
+            device=device,
+        )
+
+        def sample_input(op, device, dtype, requires_grad, **kwargs):
+            yield SampleInput(
+                make_arg((S,), dtype=dtype), make_arg((S,), dtype=torch.float16)
+            )
+
+        op = copy.copy(op)
+        op.sample_inputs_func = sample_input
+
+        self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=True, inplace=False)
 
 
     def test_empty_quantized(self):
@@ -1285,26 +1327,22 @@ class TestMeta(TestCase):
 
     @onlyCPU
     def test_meta_autograd_no_error(self):
-        lib = torch.library.Library("meta_test", "DEF")
-        impl_cpu = torch.library.Library("meta_test", "IMPL", "CPU")
-        impl_meta = torch.library.Library("meta_test", "IMPL", "Meta")
+        with torch.library._scoped_library("meta_test", "DEF") as lib:
+            with torch.library._scoped_library("meta_test", "IMPL", "CPU") as impl_cpu:
+                with torch.library._scoped_library("meta_test", "IMPL", "Meta") as impl_meta:
+                    def foo_impl(x):
+                        return x + 1
 
-        def foo_impl(x):
-            return x + 1
+                    lib.define("foo(Tensor a) -> Tensor")
+                    impl_meta.impl("foo", foo_impl)
+                    impl_cpu.impl("foo", foo_impl)
 
-        lib.define("foo(Tensor a) -> Tensor")
-        impl_meta.impl("foo", foo_impl)
-        impl_cpu.impl("foo", foo_impl)
-
-        a = torch.ones(2, device='meta')
-        # The point of the test is that this should not error:
-        # We have a fallthrough kernel registered to the AutogradMeta
-        # key for custom ops, so it's fine that `foo()` doesn't have
-        # an autograd kernel.
-        b = torch.ops.meta_test.foo.default(a)
-        del impl_meta
-        del impl_cpu
-        del lib
+                    a = torch.ones(2, device='meta')
+                    # The point of the test is that this should not error:
+                    # We have a fallthrough kernel registered to the AutogradMeta
+                    # key for custom ops, so it's fine that `foo()` doesn't have
+                    # an autograd kernel.
+                    b = torch.ops.meta_test.foo.default(a)
 
     def test_huber_loss_backward(self):
         inps = [torch.rand(2**52, device='meta') for _ in range(3)]

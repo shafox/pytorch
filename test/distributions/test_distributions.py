@@ -891,6 +891,7 @@ class TestDistributions(DistributionsTestCase):
                                 num_samples=10000, failure_rate=1e-3):
         """Runs a Chi2-test for the support, but ignores tail instead of combining"""
         torch_samples = torch_dist.sample((num_samples,)).squeeze()
+        torch_samples = torch_samples.float() if torch_samples.dtype == torch.bfloat16 else torch_samples
         torch_samples = torch_samples.cpu().numpy()
         unique, counts = np.unique(torch_samples, return_counts=True)
         pmf = ref_dist.pmf(unique)
@@ -1149,6 +1150,9 @@ class TestDistributions(DistributionsTestCase):
             self._gradcheck_log_prob(lambda p: Binomial(total_count, p), [p])
             self._gradcheck_log_prob(lambda p: Binomial(total_count, None, p.log()), [p])
         self.assertRaises(NotImplementedError, Binomial(10, p).rsample)
+
+    test_binomial_half = set_default_dtype(torch.float16)(test_binomial)
+    test_binomial_bfloat16 = set_default_dtype(torch.bfloat16)(test_binomial)
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_binomial_sample(self):
@@ -1463,11 +1467,15 @@ class TestDistributions(DistributionsTestCase):
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     def test_poisson_sample(self):
         set_rng_seed(1)  # see Note [Randomized statistical tests]
-        for rate in [0.1, 1.0, 5.0]:
-            self._check_sampler_discrete(Poisson(rate),
-                                         scipy.stats.poisson(rate),
-                                         f'Poisson(lambda={rate})',
-                                         failure_rate=1e-3)
+        saved_dtype = torch.get_default_dtype()
+        for dtype in [torch.float, torch.double, torch.bfloat16, torch.half]:
+            torch.set_default_dtype(dtype)
+            for rate in [0.1, 1.0, 5.0]:
+                self._check_sampler_discrete(Poisson(rate),
+                                             scipy.stats.poisson(rate),
+                                             f'Poisson(lambda={rate})',
+                                             failure_rate=1e-3)
+        torch.set_default_dtype(saved_dtype)
 
     @unittest.skipIf(not TEST_CUDA, "CUDA not found")
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
@@ -4040,6 +4048,12 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertRaises(ValueError, continuous_bernoulli.log_prob, self.tensor_sample_2)
         self.assertEqual(continuous_bernoulli.log_prob(torch.ones(3, 1, 1)).size(), torch.Size((3, 3, 2)))
 
+    @skipIfTorchDynamo("Not a TorchDynamo suitable test")
+    def test_mixture_same_family_mean_shape(self):
+        mix_distribution = Categorical(torch.ones([3, 1, 3]))
+        component_distribution = Normal(torch.zeros([3, 3, 3]), torch.ones([3, 3, 3]))
+        gmm = MixtureSameFamily(mix_distribution, component_distribution)
+        self.assertEqual(len(gmm.mean.shape), 2)
 
 @skipIfTorchDynamo("Not a TorchDynamo suitable test")
 class TestKL(DistributionsTestCase):

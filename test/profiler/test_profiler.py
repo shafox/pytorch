@@ -426,9 +426,49 @@ class TestExecutionTrace(TestCase):
                 loop_count += 1
             # Check if tensor tuple representation size is correct.
             if n["name"] == "## TEST 2 ##":
-                assert len(n["inputs"][3][0]) == tensor_tuple_size
+                assert len(n["inputs"]["values"][3][0]) == tensor_tuple_size
         assert found_root_node
         assert loop_count == expected_loop_events
+
+    @unittest.skipIf(IS_WINDOWS, 'torch.compile does not support WINDOWS')
+    @unittest.skipIf(sys.version_info >= (3, 12), "torch.compile is not supported on python 3.12+")
+    def test_execution_trace_with_pt2(self):
+
+        class ConvAndRelu(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.linear = nn.Linear(4096, 4096)
+                self.relu = nn.ReLU(inplace=True)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                x = self.linear(x)
+                x = self.relu(x)
+                return x
+
+        # Create a temp file to save execution trace data.
+        fp = tempfile.NamedTemporaryFile('w+t', suffix='.et.json', delete=False)
+        fp.close()
+
+        test_module = torch.compile(ConvAndRelu())
+
+        x = torch.rand(128, 4096)
+        et = ExecutionTraceObserver()
+        et.register_callback(fp.name)
+        et.start()
+        test_module.forward(x)
+        et.stop()
+
+        assert fp.name == et.get_output_file_path()
+        et.unregister_callback()
+        nodes = self.get_execution_trace_root(fp.name)
+
+        found_root_node = False
+        for n in nodes:
+            assert "name" in n
+            if "[pytorch|profiler|execution_trace|process]" in n["name"]:
+                found_root_node = True
+
+        assert found_root_node
 
     def test_execution_trace_start_stop(self):
         use_cuda = torch.profiler.ProfilerActivity.CUDA in supported_activities()
@@ -1796,6 +1836,25 @@ assert KinetoStepTracker.current_step() == initial_step + 2 * niters
                     x.add(y)
 
         self.assertGreaterEqual(len([e for e in p.events() if e.name == "guarded_rff"]), 4)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+    def test_event_list(self):
+        # AFAIK event list is part of legacy profiler and/or used when kineto is not available.
+        # This test has basic sanity checks to test against obvious regressions.
+        x, y = (torch.rand((4, 4), requires_grad=True, device="cuda") for _ in range(2))
+        with profile(with_stack=True) as p:
+            z = (x @ y).relu().sum()
+            z.backward()
+
+        event_list = torch.autograd.profiler_util.EventList(p.events())
+        # event_list._build_tree()
+
+        with TemporaryFileName(mode="w+") as fname:
+            event_list.export_chrome_trace(fname)
+            with open(fname) as f:
+                json.load(f)
+
+        event_list.table()
 
 
 def find_node_with_name(nodes, name):

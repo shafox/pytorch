@@ -2,12 +2,13 @@
 import os
 import unittest
 
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import torch
 from torch import multiprocessing as mp
 from torch._dynamo.test_case import run_tests, TestCase
 from torch._dynamo.testing import reset_rng_state
+from torch._dynamo.utils import counters
 from torch._inductor import config
 from torch._inductor.autotune_process import (
     BenchmarkRequest,
@@ -219,6 +220,106 @@ class TestMaxAutotune(TestCase):
         with config.patch({"max_autotune": True}):
             torch.compile(mm, dynamic=dynamic)(a, b)
 
+    def test_precompilation_threads(self):
+        import threading
+        from typing import Any, Dict
+        from unittest.mock import Mock, patch
+
+        class FakeChoiceCaller(ChoiceCaller):
+            def __init__(self):
+                super().__init__("none", [], Mock())
+                self.thread_id = None
+
+            def precompile(self):
+                self.thread_id = threading.get_ident()
+
+            def call_name(self) -> str:
+                return None
+
+            def to_callable(self):
+                return None
+
+            def hash_key(self) -> str:
+                return None
+
+            def output_node(self) -> "TensorBox":  # noqa: F821
+                return None
+
+        fake_choices = [FakeChoiceCaller() for i in range(10)]
+        fake_lookup_result = {choice: 0.123 for choice in fake_choices}
+
+        def no_lookup(
+            choices: List[ChoiceCaller],
+            op: str,
+            inputs: str,
+            benchmark: Callable[[Any], Dict[ChoiceCaller, float]],
+        ) -> Dict[ChoiceCaller, float]:
+            return benchmark(choices)
+
+        asc = AlgorithmSelectorCache()
+
+        def fake_benchmark_fn(*args, **kwargs):
+            return fake_lookup_result
+
+        main_thread_id = threading.get_ident()
+        mock_debug_handler = Mock()
+        old_debug_handler = V.debug
+        try:
+            V.set_debug_handler(mock_debug_handler)
+            with patch.object(asc, "lookup", new=no_lookup):
+                with patch.object(
+                    asc, "make_benchmark_fn", return_value=fake_benchmark_fn
+                ):
+                    with config.patch(
+                        {
+                            "autotune_in_subproc": False,
+                            "compile_threads": len(fake_choices),
+                        }
+                    ):
+                        asc("test_call", fake_choices, [], Mock())
+            for fake_choice in fake_choices:
+                assert (
+                    fake_choice.thread_id is not None
+                ), "Expected all ChoiceCaller's precompile method to have been called"
+                assert (
+                    fake_choice.thread_id != main_thread_id
+                ), "Expected all ChoiceCaller's precompile method to have been called on separate thread"
+        finally:
+            V.set_debug_handler(old_debug_handler)
+
+    @unittest.skipIf(not SM75OrLater, "need sm_75")
+    @unittest.skipIf(config.is_fbcode(), "fbcode requires different CUTLASS path setup")
+    @unittest.mock.patch.dict(os.environ, {"PATH": _get_path_without_sccache()})
+    def test_max_autotune_precompile(self):
+        """
+        Make sure autotuning mm in sub processes work without crashes.
+        """
+
+        if torch.version.hip:
+            return
+
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+
+        def mm(a, b):
+            return a @ b
+
+        a = torch.randn(100, 10).cuda().half()
+        b = torch.randn(10, 100).cuda().half()
+
+        with config.patch(
+            {
+                "max_autotune": True,
+                "autotune_in_subproc": True,
+                "max_autotune_gemm_backends": "CUTLASS,Triton,ATen",
+                "compile_threads": 4,
+                "cuda.cutlass_dir": _CUTLASS_DIR,
+                "cuda.cutlass_max_profiling_configs": 2,
+            }
+        ):
+            Y_compiled = torch.compile(mm, dynamic=False)(a, b)
+            Y = mm(a, b)
+            torch.testing.assert_close(Y_compiled, Y)
+
     # TODO: Enable dynamic test cases when dynamic support is added.
     @unittest.skipIf(not SM75OrLater, "need sm_75")
     @unittest.skipIf(config.is_fbcode(), "fbcode requires different CUTLASS path setup")
@@ -256,6 +357,154 @@ class TestMaxAutotune(TestCase):
             Y = mm(a, b)
             torch.testing.assert_close(Y_compiled, Y)
 
+    def _test_max_autotune_cutlass_backend_epilogue_fusion(
+        self,
+        dynamic: bool = False,
+        max_autotune_gemm_backends: str = "CUTLASS",
+        mixed_precision=False,
+        fp16=True,
+        expected_fuse_count=1,
+        mm: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = None,
+    ):
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = (
+            mixed_precision
+        )
+
+        # Note: The ops that are available
+        # also depend on the alignment of the shapes
+        # so if these shapes don't all align to at least 8 elements
+        # it can happen that no Cutlass 3.x op is available
+        # that allows fusions
+        a = torch.randn(256, 32).cuda()
+        b = torch.randn(32, 256).cuda()
+        if fp16:
+            a = a.half()
+            b = b.half()
+
+        with config.patch(
+            {
+                "max_autotune": True,
+                "autotune_in_subproc": False,
+                "max_autotune_gemm_backends": max_autotune_gemm_backends,
+                "cuda.cutlass_dir": _CUTLASS_DIR,
+                "cuda.cutlass_max_profiling_configs": 4,
+                "cuda.cutlass_only_evt_capable_ops": True,
+                "cuda.version": "12.2",  # required to enable the Kernels we need
+            }
+        ):
+            counters["inductor"]["cuda_epilogue_fusion_counter"] = 0
+            Y_compiled = torch.compile(mm, dynamic=dynamic)(a, b)
+            Y = mm(a, b)
+            actual_count = counters["inductor"]["cuda_epilogue_fusion_counter"]
+            assert (
+                actual_count == expected_fuse_count
+            ), f"Expected fuse count of {expected_fuse_count} but got {actual_count}"
+            torch.testing.assert_close(Y_compiled, Y, atol=1e-2, rtol=1e-2)
+
+    @unittest.skipIf(not SM90OrLater, "need sm_90")
+    @unittest.skipIf(torch.version.hip, "HIP not supported")
+    @unittest.skipIf(config.is_fbcode(), "fbcode requires different CUTLASS path setup")
+    def test_max_autotune_cutlass_backend_simple_fusion_fp16(self):
+        def mm(a, b):
+            return (a @ b) * 3.0
+
+        #  The pointwise ops seem to be pre-fused into a single Pointwise
+        self._test_max_autotune_cutlass_backend_epilogue_fusion(
+            mixed_precision=False, fp16=True, expected_fuse_count=1, mm=mm
+        )
+
+    @unittest.skipIf(not SM90OrLater, "need sm_90")
+    @unittest.skipIf(torch.version.hip, "HIP not supported")
+    @unittest.skipIf(config.is_fbcode(), "fbcode requires different CUTLASS path setup")
+    def test_max_autotune_cutlass_backend_simple_fusion_fp16_fp32acc(self):
+        def mm(a, b):
+            return (a @ b) * 3.0
+
+        self._test_max_autotune_cutlass_backend_epilogue_fusion(
+            mixed_precision=True, fp16=True, expected_fuse_count=1, mm=mm
+        )
+
+    @unittest.skipIf(not SM90OrLater, "need sm_90")
+    @unittest.skipIf(torch.version.hip, "HIP not supported")
+    @unittest.skipIf(config.is_fbcode(), "fbcode requires different CUTLASS path setup")
+    def test_max_autotune_cutlass_backend_chained_fusion_fp16(self):
+        def mm(a, b):
+            return (a @ b) * 3.3 - 1.234
+
+        #  The pointwise ops seem to be pre-fused into a single Pointwise
+        self._test_max_autotune_cutlass_backend_epilogue_fusion(
+            mixed_precision=False, fp16=True, expected_fuse_count=1, mm=mm
+        )
+
+    @unittest.skipIf(not SM90OrLater, "need sm_90")
+    @unittest.skipIf(torch.version.hip, "HIP not supported")
+    @unittest.skipIf(config.is_fbcode(), "fbcode requires different CUTLASS path setup")
+    def test_max_autotune_cutlass_backend_chained_fusion_fp16_fp32acc(self):
+        def mm(a, b):
+            return (a @ b) * 3.3 - 1.234
+
+        self._test_max_autotune_cutlass_backend_epilogue_fusion(
+            mixed_precision=True, fp16=True, expected_fuse_count=1, mm=mm
+        )
+
+    @unittest.skipIf(not SM90OrLater, "need sm_90")
+    @unittest.skipIf(torch.version.hip, "HIP not supported")
+    @unittest.skipIf(config.is_fbcode(), "fbcode requires different CUTLASS path setup")
+    def test_max_autotune_cutlass_backend_relu_fusion_fp16(self):
+        def mm(a, b):
+            return torch.nn.functional.relu((a @ b) * 3.3 - 1.234)
+
+        self._test_max_autotune_cutlass_backend_epilogue_fusion(
+            mixed_precision=False, fp16=True, expected_fuse_count=1, mm=mm
+        )
+
+    @unittest.skipIf(not SM90OrLater, "need sm_90")
+    @unittest.skipIf(torch.version.hip, "HIP not supported")
+    @unittest.skipIf(config.is_fbcode(), "fbcode requires different CUTLASS path setup")
+    def test_max_autotune_cutlass_backend_relu_fusion_fp16_fp32acc(self):
+        def mm(a, b):
+            return torch.nn.functional.relu((a @ b) * 3.3 - 1.234)
+
+        #  The pointwise ops seem to be pre-fused into a single Pointwise
+        self._test_max_autotune_cutlass_backend_epilogue_fusion(
+            mixed_precision=True, fp16=True, expected_fuse_count=1, mm=mm
+        )
+
+    @unittest.skipIf(not SM90OrLater, "need sm_90")
+    @unittest.skipIf(torch.version.hip, "HIP not supported")
+    @unittest.skipIf(config.is_fbcode(), "fbcode requires different CUTLASS path setup")
+    def test_max_autotune_cutlass_backend_relu6_fusion_fp16_fp32acc(self):
+        def mm(a, b):
+            return torch.clamp(torch.nn.functional.relu(a @ b), max=6.0)
+
+        #  The pointwise ops seem to be pre-fused into a single Pointwise
+        self._test_max_autotune_cutlass_backend_epilogue_fusion(
+            mixed_precision=True, fp16=True, expected_fuse_count=1, mm=mm
+        )
+
+    @unittest.skipIf(not SM90OrLater, "need sm_90")
+    @unittest.skipIf(torch.version.hip, "HIP not supported")
+    @unittest.skipIf(config.is_fbcode(), "fbcode requires different CUTLASS path setup")
+    def test_max_autotune_cutlass_backend_no_fusion_dtype_mismatch(self):
+        def mm(a, b):
+            # this should not be fused, since the output dtype is different from the matmul dtype
+            return (a @ b).to(torch.float32) * 0.00001
+
+        self._test_max_autotune_cutlass_backend_epilogue_fusion(
+            mixed_precision=True, fp16=True, expected_fuse_count=0, mm=mm
+        )
+
+    @unittest.skipIf(not SM90OrLater, "need sm_90")
+    @unittest.skipIf(torch.version.hip, "HIP not supported")
+    @unittest.skipIf(config.is_fbcode(), "fbcode requires different CUTLASS path setup")
+    def test_max_autotune_cutlass_backend_shape_dependent_normalization_fusion(self):
+        def mm(a, b):
+            return (a @ b) / b.size(1)
+
+        self._test_max_autotune_cutlass_backend_epilogue_fusion(
+            mixed_precision=True, fp16=True, expected_fuse_count=1, mm=mm
+        )
+
     # TODO: Enable dynamic test cases when dynamic support is added.
     @unittest.skipIf(not SM75OrLater, "need sm_75")
     @unittest.skipIf(config.is_fbcode(), "fbcode requires different CUTLASS path setup")
@@ -263,7 +512,7 @@ class TestMaxAutotune(TestCase):
     @parametrize("max_autotune_gemm_backends", ("CUTLASS", "ATen,Triton,CUTLASS"))
     @unittest.mock.patch.dict(os.environ, {"PATH": _get_path_without_sccache()})
     def test_max_autotune_cutlass_backend_mm_bias(
-        self, dynamic: bool, max_autotune_gemm_backends: str
+        self, dynamic: bool = False, max_autotune_gemm_backends: str = "CUTLASS"
     ):
         """
         Make sure autotuning mm in sub processes work without crashes.
@@ -294,7 +543,7 @@ class TestMaxAutotune(TestCase):
             torch.testing.assert_close(Y_compiled, Y, atol=1e-1, rtol=1e-1)
 
     @parametrize("dynamic", (False, True))
-    def test_max_autotune_addmm(self, dynamic):
+    def test_max_autotune_addmm(self, dynamic=False):
         """
         Make sure autotuning addmm in sub processes work without crashes.
         """
@@ -531,7 +780,7 @@ class TestBenchmarkRequest(BenchmarkRequest):
         # failure by virtue of not receiving the expected result back.
         visible_devices = os.environ.get(CUDA_VISIBLE_DEVICES)
         if not self.multi_device:
-            assert visible_devices == self.parent_valid_devices
+            assert visible_devices == self.parent_visible_devices
         else:
             valid_devices = self.parent_visible_devices.split(",")
             assert visible_devices in valid_devices
@@ -567,7 +816,7 @@ class TestTuningProcess(TestCase):
             # Then send another request and make sure the sub-process
             # has restarted and is operational. 'valid_devices' expected
             # to be None because autotune_multi_device is off.
-            choice.bmreq.parent_valid_devices = os.environ.get(CUDA_VISIBLE_DEVICES)
+            choice.bmreq.parent_visible_devices = os.environ.get(CUDA_VISIBLE_DEVICES)
 
             timings = tuning_pool.benchmark([choice])
             self.assertTrue(choice in timings)

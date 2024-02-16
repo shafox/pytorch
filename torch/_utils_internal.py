@@ -1,5 +1,7 @@
+import functools
 import logging
 import os
+import sys
 import tempfile
 from typing import Any, Dict
 
@@ -48,11 +50,16 @@ def resolve_library_path(path: str) -> str:
 
 
 def throw_abstract_impl_not_imported_error(opname, module, context):
-    raise NotImplementedError(
-        f"{opname}: We could not find the abstract impl for this operator. "
-        f"The operator specified that you need to import the '{module}' Python "
-        f"module to load the abstract impl. {context}"
-    )
+    if module in sys.modules:
+        raise NotImplementedError(
+            f"{opname}: We could not find the abstract impl for this operator. "
+        )
+    else:
+        raise NotImplementedError(
+            f"{opname}: We could not find the abstract impl for this operator. "
+            f"The operator specified that you may need to import the '{module}' "
+            f"Python module to load the abstract impl. {context}"
+        )
 
 
 # Meta only, see
@@ -74,6 +81,25 @@ def signpost_event(category: str, name: str, parameters: Dict[str, Any]):
 
 def log_compilation_event(metrics):
     log.info("%s", metrics)
+
+
+def print_graph(graph, msg: str):
+    pass
+
+
+def set_pytorch_distributed_envs_from_justknobs():
+    pass
+
+
+def log_export_usage(**kwargs):
+    pass
+
+
+@functools.lru_cache(None)
+def max_clock_rate():
+    from triton.testing import nvsmi
+
+    return nvsmi(["clocks.max.sm"])[0]
 
 
 TEST_MASTER_ADDR = "127.0.0.1"

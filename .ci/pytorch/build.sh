@@ -28,6 +28,8 @@ echo "Environment variables:"
 env
 
 if [[ "$BUILD_ENVIRONMENT" == *cuda* ]]; then
+  # Use jemalloc during compilation to mitigate https://github.com/pytorch/pytorch/issues/116289
+  export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
   echo "NVCC version:"
   nvcc --version
 fi
@@ -63,6 +65,12 @@ else
   export LLVM_DIR=/opt/llvm/lib/cmake/llvm
 fi
 
+if [[ "$BUILD_ENVIRONMENT" == *executorch* ]]; then
+  # To build test_edge_op_registration
+  export BUILD_EXECUTORCH=ON
+  export USE_CUDA=0
+fi
+
 if ! which conda; then
   # In ROCm CIs, we are doing cross compilation on build machines with
   # intel cpu and later run tests on machines with amd cpu.
@@ -74,6 +82,13 @@ if ! which conda; then
   fi
 else
   export CMAKE_PREFIX_PATH=/opt/conda
+
+  # Workaround required for MKL library linkage
+  # https://github.com/pytorch/pytorch/issues/119557
+  if [ "$ANACONDA_PYTHON_VERSION" = "3.12" ]; then
+    export CMAKE_LIBRARY_PATH="/opt/conda/envs/py_$ANACONDA_PYTHON_VERSION/lib/"
+    export CMAKE_INCLUDE_PATH="/opt/conda/envs/py_$ANACONDA_PYTHON_VERSION/include/"
+  fi
 fi
 
 if [[ "$BUILD_ENVIRONMENT" == *libtorch* ]]; then
@@ -143,6 +158,12 @@ if [[ "$BUILD_ENVIRONMENT" == *rocm* ]]; then
 
   # hipify sources
   python tools/amd_build/build_amd.py
+fi
+
+if [[ "$BUILD_ENVIRONMENT" == *xpu* ]]; then
+  # shellcheck disable=SC1091
+  source /opt/intel/oneapi/compiler/latest/env/vars.sh
+  export USE_XPU=1
 fi
 
 # sccache will fail for CUDA builds if all cores are used for compiling

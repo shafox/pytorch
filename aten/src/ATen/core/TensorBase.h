@@ -415,7 +415,7 @@ class TORCH_API TensorBase {
   }
 
   /// Returns a `Tensor`'s device index.
-  int64_t get_device() const {
+  DeviceIndex get_device() const {
     // NB: this is not a native function to avoid dispatching overhead.
     return impl_->get_device();
   }
@@ -474,6 +474,12 @@ class TORCH_API TensorBase {
   bool is_ve() const {
     // NB: this is not a native function to avoid dispatching overhead.
     return impl_->is_ve();
+  }
+
+  /// Returns if a `Tensor` has PrivateUse1 backend.
+  bool is_privateuseone() const {
+    // NB: this is not a native function to avoid dispatching overhead.
+    return impl_->is_privateuseone();
   }
 
   /// Returns if a `Tensor` has sparse backend.
@@ -587,8 +593,11 @@ class TORCH_API TensorBase {
     return mutable_data_ptr();
   }
 
-  template <typename T>
+  template <typename T, std::enable_if_t<!std::is_const<T>::value, int> = 0>
   const T* const_data_ptr() const;
+
+  template <typename T, std::enable_if_t<std::is_const<T>::value, int> = 0>
+  const std::remove_const_t<T>* const_data_ptr() const;
 
   template <typename T>
   T* mutable_data_ptr() const;
@@ -614,7 +623,13 @@ class TORCH_API TensorBase {
   TensorAccessor<T,N> accessor() const& {
     static_assert(N > 0, "accessor is used for indexing tensor, for scalars use *data_ptr<T>()");
     TORCH_CHECK(dim() == N, "TensorAccessor expected ", N, " dims but tensor has ", dim());
-    return TensorAccessor<T,N>(data_ptr<T>(),sizes().data(),strides().data());
+    T* ptr = nullptr;
+    if constexpr (std::is_const<T>::value) {
+      ptr = const_data_ptr<T>();
+    } else {
+      ptr = mutable_data_ptr<T>();
+    }
+    return TensorAccessor<T,N>(ptr,sizes().data(),strides().data());
   }
   template<typename T, size_t N>
   TensorAccessor<T,N> accessor() && = delete;
@@ -628,7 +643,13 @@ class TORCH_API TensorBase {
   GenericPackedTensorAccessor<T,N,PtrTraits,index_t> generic_packed_accessor() const& {
     static_assert(N > 0, "accessor is used for indexing tensor, for scalars use *data_ptr<T>()");
     TORCH_CHECK(dim() == N, "TensorAccessor expected ", N, " dims but tensor has ", dim());
-    return GenericPackedTensorAccessor<T,N,PtrTraits,index_t>(static_cast<typename PtrTraits<T>::PtrType>(data_ptr<T>()),sizes().data(),strides().data());
+    T* ptr = nullptr;
+    if constexpr (std::is_const<T>::value) {
+      ptr = const_data_ptr<T>();
+    } else {
+      ptr = mutable_data_ptr<T>();
+    }
+    return GenericPackedTensorAccessor<T,N,PtrTraits,index_t>(static_cast<typename PtrTraits<T>::PtrType>(ptr),sizes().data(),strides().data());
   }
   template<typename T, size_t N, template <typename U> class PtrTraits = DefaultPtrTraits, typename index_t = int64_t>
   GenericPackedTensorAccessor<T,N> generic_packed_accessor() && = delete;
@@ -898,7 +919,7 @@ private:
   TensorBase __dispatch_contiguous(c10::MemoryFormat) const;
 };
 
-inline int64_t get_device(const TensorBase& self) {
+inline DeviceIndex get_device(const TensorBase& self) {
   return self.get_device();
 }
 
@@ -990,7 +1011,7 @@ inline c10::MaybeOwned<TensorBase> borrow_from_optional_tensor(
     const c10::optional<TensorBase>& opt) {
   return opt.has_value()
     ? c10::MaybeOwned<TensorBase>::borrowed(*opt)
-    : c10::MaybeOwned<TensorBase>::owned(c10::in_place);
+    : c10::MaybeOwned<TensorBase>::owned(std::in_place);
 }
 
 inline c10::MaybeOwned<TensorBase> TensorBase::expect_contiguous(MemoryFormat memory_format) const & {
